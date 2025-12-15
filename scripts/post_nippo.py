@@ -35,6 +35,7 @@ Level8: どれか2100
 - ②ブロック終了条件遵守率（1h継続・2連敗・連続tiltの全条件を含む）
 - ③その日の「イライラしたか？」項目の平均値（してない0~2した）
 - ④その日の「形勢判断意識」項目の平均値（全く意識できなかった0~5超意識できた）
+'''
 |①|②|③|④|
 --------------
 15|　|　|　|　|
@@ -45,6 +46,7 @@ Level8: どれか2100
 20|　|　|　|　|
 21|　|　|　|　|
 --------------
+'''
 """
 
 def post(text: str):
@@ -52,7 +54,10 @@ def post(text: str):
     req = urllib.request.Request(
         POST_URL,
         data=payload,
-        headers={"Content-Type": "application/json"},
+        headers={
+            "Content-Type": "application/json",
+            "User-Agent": "nippo-reminder/1.0 (+https://github.com/<owner>/<repo>)",
+            },
         method="POST",
     )
     with urllib.request.urlopen(req) as resp:
