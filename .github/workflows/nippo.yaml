@@ -1,0 +1,20 @@
+name: nippo-reminder
+
+on:
+  schedule:
+    - cron: "0 22 * * *"  # 07:00 JST = 22:00 UTC
+  workflow_dispatch: {}
+
+jobs:
+  post:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+      - name: Post to Discord thread
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_THREAD_ID: ${{ secrets.DISCORD_THREAD_ID }}
+        run: python3 scripts/post_nippo.py
