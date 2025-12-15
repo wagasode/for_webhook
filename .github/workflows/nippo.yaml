@@ -3,7 +3,7 @@ name: nippo-reminder
 on:
   schedule:
     - cron: "0 22 * * *"  # 07:00 JST = 22:00 UTC
-    - cron: "30 14 * * *"  # 23:30 JST
+    - cron: "05 14 * * *"  # 23:30 JST
   workflow_dispatch:
     inputs:
       mode:
