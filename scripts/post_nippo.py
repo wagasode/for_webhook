@@ -1,5 +1,9 @@
 import os, json, urllib.request
-
+from zoneinfo import ZoneInfo
+MODE = os.environ.get("MODE", "morning")
+USER_ID = os.environ["DISCORD_USER_ID"]
+JST = ZoneInfo("Asia/Tokyo")
+today_str = __import__("datetime").datetime.now(JST).strftime("%Y-%m-%d")
 WEBHOOK_URL = os.environ["DISCORD_WEBHOOK_URL"]
 THREAD_ID = os.environ["DISCORD_THREAD_ID"]
 POST_URL = f"{WEBHOOK_URL}?thread_id={THREAD_ID}"
@@ -48,6 +52,7 @@ Level8: どれか2100
 --------------
 ```
 """
+NIGHT = f"<@{USER_ID}> 23:30になったので{today_str}のランクマは終了だよ！\n根性入れろ"
 
 def post(text: str):
     payload = json.dumps({"content": text}).encode("utf-8")
@@ -65,11 +70,12 @@ def post(text: str):
 
 # 2000文字制限対策（安全側で分割）
 MAX = 1900
-if len(CONTENT) <= 2000:
-    post(CONTENT)
+text = CONTENT if MODE == "morning" else NIGHT
+if len(text) <= 2000:
+    post(text)
 else:
     buf = ""
-    for line in CONTENT.splitlines(True):
+    for line in text.splitlines(True):
         if len(buf) + len(line) > MAX:
             post(buf)
             buf = ""

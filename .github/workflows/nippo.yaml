@@ -3,6 +3,7 @@ name: nippo-reminder
 on:
   schedule:
     - cron: "0 22 * * *"  # 07:00 JST = 22:00 UTC
+    - cron: "30 14 * * *"  # 23:30 JST
   workflow_dispatch: {}
 
 jobs:
@@ -13,8 +14,19 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
-      - name: Post to Discord thread
+      - name: Post morning
+        if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 22 * * *'
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_THREAD_ID: ${{ secrets.DISCORD_THREAD_ID }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          MODE: morning
+        run: python3 scripts/post_nippo.py
+      - name: Post night
+        if: github.event.schedule == '30 14 * * *'
+        env:
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_THREAD_ID: ${{ secrets.DISCORD_THREAD_ID }}
+          DISCORD_USER_ID: ${{ secrets.DISCORD_USER_ID }}
+          MODE: night
         run: python3 scripts/post_nippo.py
