@@ -3,7 +3,7 @@ name: nippo-reminder
 on:
   schedule:
     - cron: "0 22 * * *"  # 07:00 JST = 22:00 UTC
-    - cron: "05 14 * * *"  # 23:30 JST
+    - cron: "05 14 * * *"  # 23:05 JST
   workflow_dispatch:
     inputs:
       mode:
@@ -34,7 +34,7 @@ jobs:
         run: python3 scripts/post_nippo.py
 
       - name: Post night
-        if: github.event.schedule == '30 14 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'night' || inputs.mode == 'both'))
+        if: github.event.schedule == '05 14 * * *' || (github.event_name == 'workflow_dispatch' && (inputs.mode == 'night' || inputs.mode == 'both'))
         env:
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_THREAD_ID: ${{ secrets.DISCORD_THREAD_ID }}
