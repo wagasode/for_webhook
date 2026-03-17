@@ -1,4 +1,4 @@
-name: thread-owner-digest
+name: thread-user-digest
 
 on:
   schedule:
@@ -29,6 +29,7 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_FORUM_CHANNEL_ID: ${{ secrets.DISCORD_FORUM_CHANNEL_ID }}
+          DISCORD_TARGET_USER_ID: ${{ secrets.DISCORD_TARGET_USER_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_REPORT_THREAD_ID: ${{ secrets.DISCORD_REPORT_THREAD_ID }}
           DRY_RUN: "false"
@@ -39,6 +40,7 @@ jobs:
         env:
           DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
           DISCORD_FORUM_CHANNEL_ID: ${{ secrets.DISCORD_FORUM_CHANNEL_ID }}
+          DISCORD_TARGET_USER_ID: ${{ secrets.DISCORD_TARGET_USER_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_REPORT_THREAD_ID: ${{ secrets.DISCORD_REPORT_THREAD_ID }}
           TARGET_DATE: ${{ inputs.target_date }}

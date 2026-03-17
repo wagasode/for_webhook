@@ -1,7 +1,7 @@
-# Thread Owner Digest v1
+# Thread User Digest v1
 
 ## 機能概要
-- 指定フォーラム内の `public thread` を対象に、スレ主本人の発言を日次で集計する機能。
+- 指定フォーラム内の `public thread` を対象に、指定ユーザーの発言を日次で集計する機能。
 - 集計結果は Discord の専用スレッドへ自動投稿する。
 - 実装は既存構成（GitHub Actions + Python）を継続利用。
 
@@ -14,7 +14,7 @@
 - 対象日: デフォルトは「前日JST」。`TARGET_DATE=YYYY-MM-DD` で指定可能。
 - 対象範囲:
   - 指定フォーラム配下の `public thread`
-  - 各スレッドで `author.id == owner_id` の投稿のみ
+  - 各スレッドで `author.id == DISCORD_TARGET_USER_ID` の投稿のみ
 - 出力項目:
   - 総発言数
   - スレッド別件数（上位10）
@@ -25,6 +25,7 @@
 ## 必須Secrets / Env
 - `DISCORD_BOT_TOKEN`（読み取り用）
 - `DISCORD_FORUM_CHANNEL_ID`（集計対象フォーラム）
+- `DISCORD_TARGET_USER_ID`（集計対象ユーザー）
 - `DISCORD_WEBHOOK_URL`（投稿先Webhook）
 - `DISCORD_REPORT_THREAD_ID`（投稿先スレッド）
 
@@ -37,7 +38,7 @@
 ## テスト
 - 実装済み単体テスト:
   - JST日付境界判定
-  - ownerフィルタ
+  - target userフィルタ
   - 頻出語抽出
   - 文字数分割
 - ローカル実行コマンド:

@@ -46,7 +46,7 @@ STOPWORDS = {
 
 
 @dataclass
-class OwnerMessage:
+class TargetUserMessage:
     thread_id: str
     thread_name: str
     timestamp: str
@@ -139,16 +139,16 @@ def split_for_discord(text: str, max_len: int = MAX_DISCORD_CHARS) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def filter_owner_messages(
+def filter_target_user_messages(
     messages: list[dict[str, Any]],
-    owner_id: str,
+    target_user_id: str,
     start_utc: datetime,
     end_utc: datetime,
 ) -> list[dict[str, Any]]:
     matched: list[dict[str, Any]] = []
     for message in messages:
         author_id = str(message.get("author", {}).get("id", ""))
-        if author_id != str(owner_id):
+        if author_id != str(target_user_id):
             continue
         timestamp = message.get("timestamp")
         if not timestamp:
@@ -162,22 +162,24 @@ def filter_owner_messages(
 def build_report(
     target: date,
     forum_channel_id: str,
+    target_user_id: str,
     scanned_threads: int,
-    owner_messages: list[OwnerMessage],
+    target_user_messages: list[TargetUserMessage],
 ) -> str:
     by_thread: Counter[str] = Counter()
     token_texts: list[str] = []
 
-    for item in owner_messages:
+    for item in target_user_messages:
         by_thread[item.thread_name] += 1
         if item.content:
             token_texts.append(item.content)
 
     lines = [
-        f"スレ主発言 日次レポート ({target.isoformat()} JST)",
+        f"ユーザー発言 日次レポート ({target.isoformat()} JST)",
         f"- 対象フォーラム: <#{forum_channel_id}>",
+        f"- 対象ユーザー: <@{target_user_id}>",
         f"- 対象スレッド数: {scanned_threads}",
-        f"- 総発言数: {len(owner_messages)}",
+        f"- 総発言数: {len(target_user_messages)}",
         "",
         "【スレッド別件数 上位10】",
     ]
@@ -197,8 +199,8 @@ def build_report(
         lines.append("- なし")
 
     lines.extend(["", "【代表発言（最新5件）】"])
-    if owner_messages:
-        recent = sorted(owner_messages, key=lambda x: x.timestamp, reverse=True)[:5]
+    if target_user_messages:
+        recent = sorted(target_user_messages, key=lambda x: x.timestamp, reverse=True)[:5]
         for item in recent:
             excerpt = summarize_message_content(item.content, limit=80)
             lines.append(f"- [{item.thread_name}] {excerpt}")
@@ -338,6 +340,7 @@ def post_to_webhook(webhook_url: str, thread_id: str, text: str) -> None:
 def run() -> None:
     bot_token = os.environ["DISCORD_BOT_TOKEN"]
     forum_channel_id = os.environ["DISCORD_FORUM_CHANNEL_ID"]
+    target_user_id = os.environ["DISCORD_TARGET_USER_ID"]
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     report_thread_id = os.environ["DISCORD_REPORT_THREAD_ID"]
     target_date_raw = os.environ.get("TARGET_DATE")
@@ -348,20 +351,19 @@ def run() -> None:
     client = DiscordClient(bot_token)
 
     threads = client.list_forum_threads(forum_channel_id, start_utc)
-    owner_messages: list[OwnerMessage] = []
+    target_user_messages: list[TargetUserMessage] = []
 
     for thread in threads:
         thread_id = str(thread.get("id", ""))
-        owner_id = str(thread.get("owner_id", ""))
         thread_name = thread.get("name") or f"thread-{thread_id}"
-        if not thread_id or not owner_id:
+        if not thread_id:
             continue
 
         messages = client.list_thread_messages_for_window(thread_id, start_utc, end_utc)
-        owner_only = filter_owner_messages(messages, owner_id, start_utc, end_utc)
-        for msg in owner_only:
-            owner_messages.append(
-                OwnerMessage(
+        target_only = filter_target_user_messages(messages, target_user_id, start_utc, end_utc)
+        for msg in target_only:
+            target_user_messages.append(
+                TargetUserMessage(
                     thread_id=thread_id,
                     thread_name=thread_name,
                     timestamp=msg["timestamp"],
@@ -369,7 +371,7 @@ def run() -> None:
                 )
             )
 
-    report = build_report(target, forum_channel_id, len(threads), owner_messages)
+    report = build_report(target, forum_channel_id, target_user_id, len(threads), target_user_messages)
     print(report)
 
     if dry_run:
