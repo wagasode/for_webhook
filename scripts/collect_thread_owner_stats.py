@@ -198,12 +198,15 @@ def build_report(
         forum_mentions = "(なし)"
     if len(forum_channel_ids) > 10:
         forum_mentions += f" ほか{len(forum_channel_ids) - 10}件"
+    period_start = datetime.combine(target, time.min, tzinfo=JST)
+    period_end = period_start + timedelta(days=1) - timedelta(seconds=1)
 
     lines = [
         f"ユーザー発言 日次レポート ({target.isoformat()} JST)",
         f"- 対象フォーラム数: {len(forum_channel_ids)}",
         f"- 対象フォーラム: {forum_mentions}",
         f"- 対象ユーザー: <@{target_user_id}>",
+        f"- 集計期間: {period_start.strftime('%Y-%m-%d %H:%M:%S')} - {period_end.strftime('%Y-%m-%d %H:%M:%S')} JST",
         f"- 対象スレッド数: {scanned_threads}",
         f"- 総発言数: {len(target_user_messages)}",
         "",

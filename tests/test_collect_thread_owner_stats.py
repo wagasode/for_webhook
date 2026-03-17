@@ -2,6 +2,8 @@ import unittest
 from datetime import date, datetime, timezone
 
 from scripts.collect_thread_owner_stats import (
+    TargetUserMessage,
+    build_report,
     extract_top_tokens,
     filter_target_user_messages,
     is_timestamp_in_jst_date,
@@ -68,6 +70,23 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
     def test_parse_forum_channel_ids_fallback(self) -> None:
         parsed = parse_forum_channel_ids(None, "999")
         self.assertEqual(parsed, ["999"])
+
+    def test_build_report_contains_period(self) -> None:
+        report = build_report(
+            target=date(2026, 3, 15),
+            forum_channel_ids=["111"],
+            target_user_id="999",
+            scanned_threads=1,
+            target_user_messages=[
+                TargetUserMessage(
+                    thread_id="thread-1",
+                    thread_name="sample-thread",
+                    timestamp="2026-03-15T01:00:00+00:00",
+                    content="sample message",
+                )
+            ],
+        )
+        self.assertIn("- 集計期間: 2026-03-15 00:00:00 - 2026-03-15 23:59:59 JST", report)
 
 
 if __name__ == "__main__":
