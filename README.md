@@ -13,10 +13,13 @@
 
 ### 必須 Secrets
 - `DISCORD_BOT_TOKEN`
-- `DISCORD_FORUM_CHANNEL_ID`
+- `DISCORD_FORUM_CHANNEL_IDS`（推奨。複数IDをカンマ/改行区切りで管理）
 - `DISCORD_TARGET_USER_ID`
 - `DISCORD_WEBHOOK_URL`
 - `DISCORD_REPORT_THREAD_ID`
+
+### 互換 Secrets（任意）
+- `DISCORD_FORUM_CHANNEL_ID`（単一フォーラム運用向け。`DISCORD_FORUM_CHANNEL_IDS` 未設定時に使用）
 
 ### 手動実行入力
 - `target_date`（任意、`YYYY-MM-DD`、未指定時は前日JST）

@@ -63,6 +63,25 @@ def resolve_target_date(raw: str | None) -> date:
     return (datetime.now(JST) - timedelta(days=1)).date()
 
 
+def parse_forum_channel_ids(raw_ids: str | None, single_id: str | None = None) -> list[str]:
+    values: list[str] = []
+    if raw_ids:
+        values.extend(re.split(r"[\s,]+", raw_ids.strip()))
+    if single_id:
+        values.append(single_id.strip())
+
+    uniq: list[str] = []
+    seen: set[str] = set()
+    for value in values:
+        if not value:
+            continue
+        if value in seen:
+            continue
+        seen.add(value)
+        uniq.append(value)
+    return uniq
+
+
 def day_bounds_utc(target: date) -> tuple[datetime, datetime]:
     start_jst = datetime.combine(target, time.min, tzinfo=JST)
     end_jst = start_jst + timedelta(days=1)
@@ -161,7 +180,7 @@ def filter_target_user_messages(
 
 def build_report(
     target: date,
-    forum_channel_id: str,
+    forum_channel_ids: list[str],
     target_user_id: str,
     scanned_threads: int,
     target_user_messages: list[TargetUserMessage],
@@ -174,9 +193,16 @@ def build_report(
         if item.content:
             token_texts.append(item.content)
 
+    forum_mentions = ", ".join(f"<#{forum_id}>" for forum_id in forum_channel_ids[:10])
+    if not forum_mentions:
+        forum_mentions = "(なし)"
+    if len(forum_channel_ids) > 10:
+        forum_mentions += f" ほか{len(forum_channel_ids) - 10}件"
+
     lines = [
         f"ユーザー発言 日次レポート ({target.isoformat()} JST)",
-        f"- 対象フォーラム: <#{forum_channel_id}>",
+        f"- 対象フォーラム数: {len(forum_channel_ids)}",
+        f"- 対象フォーラム: {forum_mentions}",
         f"- 対象ユーザー: <@{target_user_id}>",
         f"- 対象スレッド数: {scanned_threads}",
         f"- 総発言数: {len(target_user_messages)}",
@@ -242,7 +268,9 @@ class DiscordClient:
         forum = self.get_channel(forum_channel_id)
         guild_id = forum.get("guild_id")
         if not guild_id:
-            raise RuntimeError("guild_id を取得できませんでした。DISCORD_FORUM_CHANNEL_ID を確認してください。")
+            raise RuntimeError(
+                "guild_id を取得できませんでした。フォーラムID（DISCORD_FORUM_CHANNEL_IDS / DISCORD_FORUM_CHANNEL_ID）を確認してください。"
+            )
 
         threads_by_id: dict[str, dict[str, Any]] = {}
 
@@ -339,7 +367,14 @@ def post_to_webhook(webhook_url: str, thread_id: str, text: str) -> None:
 
 def run() -> None:
     bot_token = os.environ["DISCORD_BOT_TOKEN"]
-    forum_channel_id = os.environ["DISCORD_FORUM_CHANNEL_ID"]
+    forum_channel_ids = parse_forum_channel_ids(
+        os.environ.get("DISCORD_FORUM_CHANNEL_IDS"),
+        os.environ.get("DISCORD_FORUM_CHANNEL_ID"),
+    )
+    if not forum_channel_ids:
+        raise RuntimeError(
+            "DISCORD_FORUM_CHANNEL_IDS または DISCORD_FORUM_CHANNEL_ID のいずれかを設定してください。"
+        )
     target_user_id = os.environ["DISCORD_TARGET_USER_ID"]
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     report_thread_id = os.environ["DISCORD_REPORT_THREAD_ID"]
@@ -350,28 +385,32 @@ def run() -> None:
     start_utc, end_utc = day_bounds_utc(target)
     client = DiscordClient(bot_token)
 
-    threads = client.list_forum_threads(forum_channel_id, start_utc)
     target_user_messages: list[TargetUserMessage] = []
+    scanned_threads = 0
 
-    for thread in threads:
-        thread_id = str(thread.get("id", ""))
-        thread_name = thread.get("name") or f"thread-{thread_id}"
-        if not thread_id:
-            continue
+    for forum_channel_id in forum_channel_ids:
+        threads = client.list_forum_threads(forum_channel_id, start_utc)
+        scanned_threads += len(threads)
 
-        messages = client.list_thread_messages_for_window(thread_id, start_utc, end_utc)
-        target_only = filter_target_user_messages(messages, target_user_id, start_utc, end_utc)
-        for msg in target_only:
-            target_user_messages.append(
-                TargetUserMessage(
-                    thread_id=thread_id,
-                    thread_name=thread_name,
-                    timestamp=msg["timestamp"],
-                    content=msg.get("content", ""),
+        for thread in threads:
+            thread_id = str(thread.get("id", ""))
+            thread_name = thread.get("name") or f"thread-{thread_id}"
+            if not thread_id:
+                continue
+
+            messages = client.list_thread_messages_for_window(thread_id, start_utc, end_utc)
+            target_only = filter_target_user_messages(messages, target_user_id, start_utc, end_utc)
+            for msg in target_only:
+                target_user_messages.append(
+                    TargetUserMessage(
+                        thread_id=thread_id,
+                        thread_name=thread_name,
+                        timestamp=msg["timestamp"],
+                        content=msg.get("content", ""),
+                    )
                 )
-            )
 
-    report = build_report(target, forum_channel_id, target_user_id, len(threads), target_user_messages)
+    report = build_report(target, forum_channel_ids, target_user_id, scanned_threads, target_user_messages)
     print(report)
 
     if dry_run:

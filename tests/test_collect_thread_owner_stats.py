@@ -5,6 +5,7 @@ from scripts.collect_thread_owner_stats import (
     extract_top_tokens,
     filter_target_user_messages,
     is_timestamp_in_jst_date,
+    parse_forum_channel_ids,
     split_for_discord,
 )
 
@@ -59,6 +60,14 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
         chunks = split_for_discord(text, max_len=1200)
         self.assertGreater(len(chunks), 1)
         self.assertTrue(all(len(chunk) <= 1200 for chunk in chunks))
+
+    def test_parse_forum_channel_ids(self) -> None:
+        parsed = parse_forum_channel_ids("111, 222\n333 222", "111")
+        self.assertEqual(parsed, ["111", "222", "333"])
+
+    def test_parse_forum_channel_ids_fallback(self) -> None:
+        parsed = parse_forum_channel_ids(None, "999")
+        self.assertEqual(parsed, ["999"])
 
 
 if __name__ == "__main__":

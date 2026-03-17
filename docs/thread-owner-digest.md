@@ -13,7 +13,7 @@
 ## 集計仕様（v1）
 - 対象日: デフォルトは「前日JST」。`TARGET_DATE=YYYY-MM-DD` で指定可能。
 - 対象範囲:
-  - 指定フォーラム配下の `public thread`
+  - 指定フォーラム群配下の `public thread`
   - 各スレッドで `author.id == DISCORD_TARGET_USER_ID` の投稿のみ
 - 出力項目:
   - 総発言数
@@ -24,16 +24,26 @@
 
 ## 必須Secrets / Env
 - `DISCORD_BOT_TOKEN`（読み取り用）
-- `DISCORD_FORUM_CHANNEL_ID`（集計対象フォーラム）
+- `DISCORD_FORUM_CHANNEL_IDS`（集計対象フォーラムID。カンマ/改行区切り）
 - `DISCORD_TARGET_USER_ID`（集計対象ユーザー）
 - `DISCORD_WEBHOOK_URL`（投稿先Webhook）
 - `DISCORD_REPORT_THREAD_ID`（投稿先スレッド）
+
+## 互換Secrets / Env（任意）
+- `DISCORD_FORUM_CHANNEL_ID`（単一フォーラム用。`DISCORD_FORUM_CHANNEL_IDS` 未設定時に利用）
 
 ## 実行方法
 - 定期実行: `thread_owner_digest.yaml` の `schedule`（毎日 08:10 JST）。
 - 手動実行: `workflow_dispatch`
   - `target_date`（任意、`YYYY-MM-DD`）
   - `dry_run`（`true` の場合は投稿せずログ出力のみ）
+
+## フォーラム追加の運用
+- 推奨は `DISCORD_FORUM_CHANNEL_IDS` 1つを更新する運用。
+- 例（カンマ区切り）: `123456789012345678,234567890123456789`
+- 例（改行区切り）:
+  - `123456789012345678`
+  - `234567890123456789`
 
 ## テスト
 - 実装済み単体テスト:
