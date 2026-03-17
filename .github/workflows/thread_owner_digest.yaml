@@ -1,0 +1,46 @@
+name: thread-owner-digest
+
+on:
+  schedule:
+    - cron: "10 23 * * *" # 08:10 JST
+  workflow_dispatch:
+    inputs:
+      target_date:
+        description: "Target date in JST (YYYY-MM-DD). Empty means yesterday."
+        required: false
+        type: string
+      dry_run:
+        description: "If true, skip Discord posting and print report only."
+        required: true
+        default: false
+        type: boolean
+
+jobs:
+  digest:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.x"
+
+      - name: Run digest (schedule)
+        if: github.event_name == 'schedule'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_FORUM_CHANNEL_ID: ${{ secrets.DISCORD_FORUM_CHANNEL_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_REPORT_THREAD_ID: ${{ secrets.DISCORD_REPORT_THREAD_ID }}
+          DRY_RUN: "false"
+        run: python3 scripts/collect_thread_owner_stats.py
+
+      - name: Run digest (manual)
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          DISCORD_BOT_TOKEN: ${{ secrets.DISCORD_BOT_TOKEN }}
+          DISCORD_FORUM_CHANNEL_ID: ${{ secrets.DISCORD_FORUM_CHANNEL_ID }}
+          DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
+          DISCORD_REPORT_THREAD_ID: ${{ secrets.DISCORD_REPORT_THREAD_ID }}
+          TARGET_DATE: ${{ inputs.target_date }}
+          DRY_RUN: ${{ inputs.dry_run }}
+        run: python3 scripts/collect_thread_owner_stats.py
