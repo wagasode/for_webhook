@@ -18,11 +18,16 @@ on:
 jobs:
   digest:
     runs-on: ubuntu-latest
+    env:
+      FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: "true"
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-python@v5
         with:
           python-version: "3.x"
+
+      - name: Install dependencies
+        run: pip install openai
 
       - name: Run digest (schedule)
         if: github.event_name == 'schedule'
@@ -33,7 +38,12 @@ jobs:
           DISCORD_TARGET_USER_ID: ${{ secrets.DISCORD_TARGET_USER_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_REPORT_THREAD_ID: ${{ secrets.DISCORD_REPORT_THREAD_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          LLM_MAX_FALLBACK_MESSAGES: ${{ vars.LLM_MAX_FALLBACK_MESSAGES }}
+          LLM_TIMEOUT_SECONDS: ${{ vars.LLM_TIMEOUT_SECONDS }}
           DRY_RUN: "false"
+          OUTPUT_DIR: artifacts
         run: python3 scripts/collect_thread_owner_stats.py
 
       - name: Run digest (manual)
@@ -45,6 +55,21 @@ jobs:
           DISCORD_TARGET_USER_ID: ${{ secrets.DISCORD_TARGET_USER_ID }}
           DISCORD_WEBHOOK_URL: ${{ secrets.DISCORD_WEBHOOK_URL }}
           DISCORD_REPORT_THREAD_ID: ${{ secrets.DISCORD_REPORT_THREAD_ID }}
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+          OPENAI_MODEL: ${{ vars.OPENAI_MODEL }}
+          LLM_MAX_FALLBACK_MESSAGES: ${{ vars.LLM_MAX_FALLBACK_MESSAGES }}
+          LLM_TIMEOUT_SECONDS: ${{ vars.LLM_TIMEOUT_SECONDS }}
           TARGET_DATE: ${{ inputs.target_date }}
           DRY_RUN: ${{ inputs.dry_run }}
+          OUTPUT_DIR: artifacts
         run: python3 scripts/collect_thread_owner_stats.py
+
+      - name: Upload digest logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: thread-user-digest-${{ github.run_id }}
+          path: |
+            artifacts/*.json
+            artifacts/*.sqlite3
+          if-no-files-found: warn

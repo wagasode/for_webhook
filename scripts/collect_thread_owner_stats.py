@@ -1,13 +1,15 @@
 import json
 import os
 import re
+import sqlite3
 import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from datetime import date, datetime, time, timedelta, timezone
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 
@@ -15,6 +17,22 @@ API_BASE = "https://discord.com/api/v10"
 JST = ZoneInfo("Asia/Tokyo")
 PUBLIC_THREAD_TYPE = 11
 MAX_DISCORD_CHARS = 1900
+OUTPUT_DIR_DEFAULT = "artifacts"
+DEFAULT_OPENAI_MODEL = "gpt-4.1-mini"
+DEFAULT_LLM_MAX_FALLBACK_MESSAGES = 200
+DEFAULT_LLM_TIMEOUT_SECONDS = 20
+DEFAULT_DECK_KEYWORDS = [
+    "AF",
+    "進化ネメシス",
+    "ネメシス",
+    "ロイヤル",
+    "ウィッチ",
+    "ドラゴン",
+    "ビショップ",
+    "ヴァンパイア",
+    "ネクロ",
+    "エルフ",
+]
 
 URL_RE = re.compile(r"https?://\S+")
 MENTION_RE = re.compile(r"<[@#][!&]?\d+>")
@@ -22,6 +40,12 @@ CUSTOM_EMOJI_RE = re.compile(r"<a?:[a-zA-Z0-9_]+:\d+>")
 TOKEN_RE = re.compile(r"[A-Za-z0-9_]{2,}|[ぁ-んァ-ン一-龥ー]{2,}")
 KATAKANA_RE = re.compile(r"[ァ-ヴー]{2,}")
 KANJI_RE = re.compile(r"[一-龥]{2,}")
+MATCHUP_HINT_RE = re.compile(r"(?:vs|VS|Vs|対面)\s*[:：]?\s*([A-Za-z0-9ぁ-んァ-ン一-龥ー]+)")
+RESULT_SCORE_RE = re.compile(r"(\d+)\s*[-ー]\s*(\d+)")
+RESULT_JP_RE = re.compile(r"(\d+)\s*勝\s*(\d+)\s*敗")
+RESULT_WL_TOKEN_RE = re.compile(r"\b([WL])\b", re.IGNORECASE)
+ISSUE_LINE_RE = re.compile(r"^\s*課題\s*[:：]?\s*(.*)$")
+NEXT_LINE_RE = re.compile(r"^\s*(?:次回?|next)\s*[:：]\s*(.*)$", re.IGNORECASE)
 STOPWORDS = {
     "です",
     "ます",
@@ -46,21 +70,60 @@ STOPWORDS = {
 
 
 @dataclass
-class TargetUserMessage:
+class RawMessage:
+    message_id: str
     thread_id: str
     thread_name: str
-    timestamp: str
-    content: str
+    timestamp_utc: str
+    raw_text: str
+
+
+@dataclass
+class StructuredEntry:
+    target_date_jst: str
+    message_id: str
+    thread_id: str
+    thread_name: str
+    timestamp_utc: str
+    raw_text: str
+    matchup: str | None
+    result: str | None
+    issue: str | None
+    next_action: str | None
+    extract_method: str
+    confidence: float
+    status: str
+
+
+LLMExtractor = Callable[[str], tuple[dict[str, Any] | None, str | None]]
 
 
 def parse_iso8601(timestamp: str) -> datetime:
     return datetime.fromisoformat(timestamp.replace("Z", "+00:00")).astimezone(timezone.utc)
 
 
+def clamp_confidence(value: Any) -> float:
+    try:
+        num = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(1.0, num))
+
+
 def resolve_target_date(raw: str | None) -> date:
     if raw:
         return datetime.strptime(raw, "%Y-%m-%d").date()
     return (datetime.now(JST) - timedelta(days=1)).date()
+
+
+def parse_positive_int(raw: str | None, default: int) -> int:
+    if not raw:
+        return default
+    try:
+        value = int(raw)
+    except ValueError:
+        return default
+    return value if value > 0 else default
 
 
 def parse_forum_channel_ids(raw_ids: str | None, single_id: str | None = None) -> list[str]:
@@ -88,9 +151,13 @@ def day_bounds_utc(target: date) -> tuple[datetime, datetime]:
     return start_jst.astimezone(timezone.utc), end_jst.astimezone(timezone.utc)
 
 
-def is_timestamp_in_jst_date(timestamp: str, target: date) -> bool:
-    dt_jst = parse_iso8601(timestamp).astimezone(JST)
-    return dt_jst.date() == target
+def period_label_jst(target: date) -> str:
+    period_start = datetime.combine(target, time.min, tzinfo=JST)
+    period_end = period_start + timedelta(days=1) - timedelta(seconds=1)
+    return (
+        f"{period_start.strftime('%Y-%m-%d %H:%M:%S')} - "
+        f"{period_end.strftime('%Y-%m-%d %H:%M:%S')} JST"
+    )
 
 
 def normalize_text(text: str) -> str:
@@ -98,6 +165,10 @@ def normalize_text(text: str) -> str:
     cleaned = MENTION_RE.sub(" ", cleaned)
     cleaned = CUSTOM_EMOJI_RE.sub(" ", cleaned)
     return cleaned
+
+
+def compact_text(text: str) -> str:
+    return re.sub(r"\s+", " ", normalize_text(text)).strip()
 
 
 def extract_top_tokens(texts: list[str], limit: int = 10) -> list[tuple[str, int]]:
@@ -115,8 +186,6 @@ def extract_top_tokens(texts: list[str], limit: int = 10) -> list[tuple[str, int
 
     for text in texts:
         for token in TOKEN_RE.findall(normalize_text(text)):
-            # Japanese contiguous text often includes particles, so also lift
-            # likely keyword units (kanji compounds / katakana words).
             subs = KATAKANA_RE.findall(token) + KANJI_RE.findall(token)
             if subs:
                 for sub in subs:
@@ -124,13 +193,6 @@ def extract_top_tokens(texts: list[str], limit: int = 10) -> list[tuple[str, int
                 continue
             add_token(token)
     return counter.most_common(limit)
-
-
-def summarize_message_content(text: str, limit: int = 80) -> str:
-    compact = re.sub(r"\s+", " ", normalize_text(text)).strip()
-    if not compact:
-        return "(本文なし)"
-    return compact if len(compact) <= limit else compact[: limit - 1] + "…"
 
 
 def split_for_discord(text: str, max_len: int = MAX_DISCORD_CHARS) -> list[str]:
@@ -158,85 +220,522 @@ def split_for_discord(text: str, max_len: int = MAX_DISCORD_CHARS) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
-def filter_target_user_messages(
-    messages: list[dict[str, Any]],
+def load_deck_keywords(path: str | None) -> list[str]:
+    if not path:
+        return DEFAULT_DECK_KEYWORDS[:]
+    p = Path(path)
+    if not p.exists():
+        return DEFAULT_DECK_KEYWORDS[:]
+    payload = json.loads(p.read_text(encoding="utf-8"))
+    if not isinstance(payload, list):
+        return DEFAULT_DECK_KEYWORDS[:]
+    keywords = [str(item).strip() for item in payload if str(item).strip()]
+    return keywords if keywords else DEFAULT_DECK_KEYWORDS[:]
+
+
+def extract_matchup(text: str, deck_keywords: list[str]) -> str | None:
+    cleaned = compact_text(text)
+    if not cleaned:
+        return None
+
+    keyword_pool = sorted(set(deck_keywords), key=len, reverse=True)
+    hinted_candidate: str | None = None
+    hinted = MATCHUP_HINT_RE.search(cleaned)
+    if hinted:
+        candidate = hinted.group(1).strip()
+        for keyword in keyword_pool:
+            if keyword in candidate:
+                return keyword
+        hinted_candidate = candidate
+
+    for keyword in keyword_pool:
+        if keyword and keyword in cleaned:
+            return keyword
+    return hinted_candidate
+
+
+def extract_result(text: str) -> str | None:
+    cleaned = compact_text(text)
+    if not cleaned:
+        return None
+
+    jp = RESULT_JP_RE.search(cleaned)
+    if jp:
+        return f"{jp.group(1)}-{jp.group(2)}"
+
+    score = RESULT_SCORE_RE.search(cleaned)
+    if score:
+        return f"{score.group(1)}-{score.group(2)}"
+
+    token = RESULT_WL_TOKEN_RE.search(cleaned)
+    if token:
+        return token.group(1).upper()
+
+    if cleaned.startswith("勝") and "敗" not in cleaned:
+        return "W"
+    if cleaned.startswith("負") and "勝" not in cleaned:
+        return "L"
+    return None
+
+
+def extract_issue_text(text: str) -> str | None:
+    lines = normalize_text(text).splitlines() or [normalize_text(text)]
+    for line in lines:
+        match = ISSUE_LINE_RE.match(line)
+        if not match:
+            continue
+        body = re.sub(r"\s+", " ", match.group(1)).strip()
+        return body if body else "(詳細なし)"
+
+    compact = compact_text(text)
+    if "課題:" in compact or "課題：" in compact:
+        after = re.split(r"課題[:：]", compact, maxsplit=1)[1].strip()
+        return after if after else "(詳細なし)"
+    return None
+
+
+def extract_next_action_text(text: str) -> str | None:
+    lines = normalize_text(text).splitlines() or [normalize_text(text)]
+    for line in lines:
+        match = NEXT_LINE_RE.match(line)
+        if not match:
+            continue
+        body = re.sub(r"\s+", " ", match.group(1)).strip()
+        if body:
+            return body
+    return None
+
+
+def rule_extract_fields(text: str, deck_keywords: list[str]) -> dict[str, str | None]:
+    return {
+        "matchup": extract_matchup(text, deck_keywords),
+        "result": extract_result(text),
+        "issue": extract_issue_text(text),
+        "next_action": extract_next_action_text(text),
+    }
+
+
+def has_any_structured_field(fields: dict[str, str | None]) -> bool:
+    return any(fields.get(key) for key in ("matchup", "result", "issue", "next_action"))
+
+
+def validate_llm_payload(payload: Any) -> dict[str, Any] | None:
+    if not isinstance(payload, dict):
+        return None
+
+    parsed: dict[str, Any] = {}
+    for key in ("matchup", "result", "issue", "next_action", "reason_short"):
+        value = payload.get(key)
+        if value is None:
+            parsed[key] = None
+            continue
+        if not isinstance(value, str):
+            return None
+        cleaned = value.strip()
+        parsed[key] = cleaned or None
+    parsed["confidence"] = clamp_confidence(payload.get("confidence", 0.0))
+    return parsed
+
+
+def make_openai_extractor(api_key: str, model: str, timeout_seconds: int) -> tuple[LLMExtractor | None, str | None]:
+    try:
+        from openai import OpenAI
+    except Exception as exc:  # pragma: no cover - dependency missing path
+        return None, f"OpenAI SDKの読み込みに失敗したためrule-onlyで実行: {exc}"
+
+    client = OpenAI(api_key=api_key, timeout=timeout_seconds)
+
+    def extractor(text: str) -> tuple[dict[str, Any] | None, str | None]:
+        system_prompt = (
+            "You are an extractor for Japanese game practice notes. "
+            "Return strict JSON with keys: matchup,result,issue,next_action,confidence,reason_short. "
+            "If unknown, use null. result must be one of: W,L,number-number,null. "
+            "Keep reason_short under 30 chars."
+        )
+        user_prompt = (
+            "以下の自由記述メモを構造化してください。\n"
+            f"メモ:\n{text}\n"
+            "JSONのみを返してください。"
+        )
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                response_format={"type": "json_object"},
+                temperature=0,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+            )
+            content = (resp.choices[0].message.content or "").strip()
+            if not content:
+                return None, "LLM応答が空"
+            payload = json.loads(content)
+            validated = validate_llm_payload(payload)
+            if not validated:
+                return None, "LLM JSONの形式が不正"
+            return validated, None
+        except Exception as exc:  # pragma: no cover - network/external path
+            return None, str(exc)
+
+    return extractor, None
+
+
+def collect_raw_messages(
+    client: "DiscordClient",
+    forum_channel_ids: list[str],
     target_user_id: str,
     start_utc: datetime,
     end_utc: datetime,
-) -> list[dict[str, Any]]:
-    matched: list[dict[str, Any]] = []
-    for message in messages:
-        author_id = str(message.get("author", {}).get("id", ""))
-        if author_id != str(target_user_id):
-            continue
-        timestamp = message.get("timestamp")
-        if not timestamp:
-            continue
-        created_at = parse_iso8601(timestamp)
-        if start_utc <= created_at < end_utc:
-            matched.append(message)
-    return matched
+) -> tuple[list[RawMessage], int]:
+    raw_messages: list[RawMessage] = []
+    seen_message_ids: set[str] = set()
+    scanned_threads = 0
+
+    for forum_channel_id in forum_channel_ids:
+        threads = client.list_forum_threads(forum_channel_id, start_utc)
+        scanned_threads += len(threads)
+        for thread in threads:
+            thread_id = str(thread.get("id", ""))
+            thread_name = thread.get("name") or f"thread-{thread_id}"
+            if not thread_id:
+                continue
+            messages = client.list_thread_messages_for_window(thread_id, start_utc, end_utc)
+            for msg in messages:
+                message_id = str(msg.get("id", ""))
+                if not message_id or message_id in seen_message_ids:
+                    continue
+                author_id = str(msg.get("author", {}).get("id", ""))
+                if author_id != str(target_user_id):
+                    continue
+                ts = str(msg.get("timestamp", ""))
+                if not ts:
+                    continue
+                created_at = parse_iso8601(ts)
+                if not (start_utc <= created_at < end_utc):
+                    continue
+                seen_message_ids.add(message_id)
+                raw_messages.append(
+                    RawMessage(
+                        message_id=message_id,
+                        thread_id=thread_id,
+                        thread_name=thread_name,
+                        timestamp_utc=ts,
+                        raw_text=msg.get("content", ""),
+                    )
+                )
+
+    raw_messages.sort(key=lambda x: x.timestamp_utc)
+    return raw_messages, scanned_threads
 
 
-def build_report(
+def build_structured_entries(
+    raw_messages: list[RawMessage],
+    target: date,
+    deck_keywords: list[str],
+    llm_extractor: LLMExtractor | None,
+    llm_max_fallback_messages: int,
+) -> tuple[list[StructuredEntry], dict[str, int]]:
+    entries: list[StructuredEntry] = []
+    unresolved_indexes: list[int] = []
+
+    for raw in raw_messages:
+        fields = rule_extract_fields(raw.raw_text, deck_keywords)
+        classified = has_any_structured_field(fields)
+        entry = StructuredEntry(
+            target_date_jst=target.isoformat(),
+            message_id=raw.message_id,
+            thread_id=raw.thread_id,
+            thread_name=raw.thread_name,
+            timestamp_utc=raw.timestamp_utc,
+            raw_text=raw.raw_text,
+            matchup=fields["matchup"],
+            result=fields["result"],
+            issue=fields["issue"],
+            next_action=fields["next_action"],
+            extract_method="rule",
+            confidence=0.7 if classified else 0.0,
+            status="classified" if classified else "unclassified",
+        )
+        entries.append(entry)
+        if not classified:
+            unresolved_indexes.append(len(entries) - 1)
+
+    llm_attempted = 0
+    llm_succeeded = 0
+    llm_failed = 0
+
+    if llm_extractor:
+        for idx in unresolved_indexes[:llm_max_fallback_messages]:
+            llm_attempted += 1
+            payload, error = llm_extractor(entries[idx].raw_text)
+            if not payload:
+                entries[idx].extract_method = "llm_failed"
+                entries[idx].status = "unclassified"
+                entries[idx].confidence = 0.0
+                llm_failed += 1
+                continue
+
+            llm_fields = {
+                "matchup": payload.get("matchup"),
+                "result": payload.get("result"),
+                "issue": payload.get("issue"),
+                "next_action": payload.get("next_action"),
+            }
+            if has_any_structured_field(llm_fields):
+                entries[idx].matchup = llm_fields["matchup"]
+                entries[idx].result = llm_fields["result"]
+                entries[idx].issue = llm_fields["issue"]
+                entries[idx].next_action = llm_fields["next_action"]
+                entries[idx].extract_method = "llm"
+                entries[idx].status = "classified"
+                entries[idx].confidence = clamp_confidence(payload.get("confidence"))
+                llm_succeeded += 1
+            else:
+                entries[idx].extract_method = "llm_failed"
+                entries[idx].status = "unclassified"
+                entries[idx].confidence = 0.0
+                llm_failed += 1
+
+    stats = {
+        "raw_count": len(raw_messages),
+        "structured_count": sum(1 for e in entries if e.status == "classified"),
+        "unclassified_count": sum(1 for e in entries if e.status == "unclassified"),
+        "llm_attempted": llm_attempted,
+        "llm_succeeded": llm_succeeded,
+        "llm_failed": llm_failed,
+    }
+    return entries, stats
+
+
+def parse_result_to_counts(result: str | None) -> tuple[int, int]:
+    if not result:
+        return (0, 0)
+    r = result.strip().upper()
+    if r == "W":
+        return (1, 0)
+    if r == "L":
+        return (0, 1)
+    score = RESULT_SCORE_RE.fullmatch(r)
+    if score:
+        return (int(score.group(1)), int(score.group(2)))
+    jp = RESULT_JP_RE.fullmatch(r)
+    if jp:
+        return (int(jp.group(1)), int(jp.group(2)))
+    return (0, 0)
+
+
+def collect_issue_entries(entries: list[StructuredEntry]) -> list[dict[str, str]]:
+    issues: list[dict[str, str]] = []
+    for entry in sorted(entries, key=lambda x: x.timestamp_utc):
+        if not entry.issue:
+            continue
+        ts_jst = parse_iso8601(entry.timestamp_utc).astimezone(JST)
+        issues.append(
+            {
+                "thread_id": entry.thread_id,
+                "thread_name": entry.thread_name,
+                "time_jst": ts_jst.strftime("%H:%M"),
+                "issue": entry.issue,
+            }
+        )
+    return issues
+
+
+def build_review_report(target: date, entries: list[StructuredEntry], warnings: list[str]) -> str:
+    period = period_label_jst(target)
+    wins = 0
+    losses = 0
+    for entry in entries:
+        w, l = parse_result_to_counts(entry.result)
+        wins += w
+        losses += l
+
+    if wins + losses > 0:
+        result_label = f"{wins}勝{losses}敗 ({wins + losses}戦)"
+    else:
+        result_label = "算出不可（勝敗情報の抽出なし）"
+
+    issue_counter = Counter([entry.issue for entry in entries if entry.issue])
+    action_counter = Counter([entry.next_action for entry in entries if entry.next_action])
+    issue_entries = collect_issue_entries(entries)
+    unclassified_count = sum(1 for entry in entries if entry.status == "unclassified")
+
+    lines = [
+        f"自由記述レビュー ({target.isoformat()} JST)",
+        f"- 対象期間: {period}",
+        "",
+        "【推定戦績】",
+        f"- {result_label}",
+        "",
+        "【頻出課題 上位5】",
+    ]
+
+    if issue_counter:
+        for idx, (issue, count) in enumerate(issue_counter.most_common(5), start=1):
+            lines.append(f"{idx}. {issue} ({count})")
+    else:
+        lines.append("- なし")
+
+    lines.extend(["", "【次回アクション候補 上位5】"])
+    if action_counter:
+        for idx, (action, count) in enumerate(action_counter.most_common(5), start=1):
+            lines.append(f"{idx}. {action} ({count})")
+    else:
+        lines.append("1. (提案) 次: 今日の課題トップ1に対する検証手順を1つ書く")
+
+    lines.extend(["", "【未分類メモ件数】", f"- {unclassified_count}件"])
+    lines.extend(["", f"【昨日見つけた課題一覧 ({len(issue_entries)}件)】"])
+
+    if issue_entries:
+        for idx, issue in enumerate(issue_entries[:20], start=1):
+            lines.append(f"{idx}. [{issue['time_jst']}] <#{issue['thread_id']}> {issue['issue']}")
+        if len(issue_entries) > 20:
+            lines.append(f"- ほか{len(issue_entries) - 20}件")
+    else:
+        lines.append("- なし")
+
+    if warnings:
+        lines.extend(["", "【処理メモ】"])
+        for warning in warnings:
+            lines.append(f"- {warning}")
+
+    return "\n".join(lines)
+
+
+def build_log_file_paths(target: date, output_dir: str) -> tuple[Path, Path, Path]:
+    base = Path(output_dir)
+    suffix = target.isoformat()
+    raw_path = base / f"thread_user_digest_{suffix}_raw_messages.json"
+    sqlite_path = base / f"thread_user_digest_{suffix}_structured.sqlite3"
+    summary_path = base / f"thread_user_digest_{suffix}_summary.json"
+    return raw_path, sqlite_path, summary_path
+
+
+def save_raw_messages_json(
+    path: Path,
+    target: date,
+    forum_channel_ids: list[str],
+    target_user_id: str,
+    raw_messages: list[RawMessage],
+) -> None:
+    payload = {
+        "target_date": target.isoformat(),
+        "period_jst": period_label_jst(target),
+        "forum_channel_ids": forum_channel_ids,
+        "target_user_id": target_user_id,
+        "raw_count": len(raw_messages),
+        "messages": [asdict(item) for item in raw_messages],
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def save_structured_sqlite(path: Path, entries: list[StructuredEntry]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    conn = sqlite3.connect(path)
+    try:
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS structured_logs (
+                target_date_jst TEXT NOT NULL,
+                message_id TEXT PRIMARY KEY,
+                thread_id TEXT NOT NULL,
+                thread_name TEXT NOT NULL,
+                timestamp_utc TEXT NOT NULL,
+                raw_text TEXT NOT NULL,
+                matchup TEXT,
+                result TEXT,
+                issue TEXT,
+                next_action TEXT,
+                extract_method TEXT NOT NULL,
+                confidence REAL NOT NULL,
+                status TEXT NOT NULL
+            )
+            """
+        )
+        conn.executemany(
+            """
+            INSERT INTO structured_logs (
+                target_date_jst, message_id, thread_id, thread_name, timestamp_utc, raw_text,
+                matchup, result, issue, next_action, extract_method, confidence, status
+            )
+            VALUES (
+                :target_date_jst, :message_id, :thread_id, :thread_name, :timestamp_utc, :raw_text,
+                :matchup, :result, :issue, :next_action, :extract_method, :confidence, :status
+            )
+            ON CONFLICT(message_id) DO UPDATE SET
+                target_date_jst=excluded.target_date_jst,
+                thread_id=excluded.thread_id,
+                thread_name=excluded.thread_name,
+                timestamp_utc=excluded.timestamp_utc,
+                raw_text=excluded.raw_text,
+                matchup=excluded.matchup,
+                result=excluded.result,
+                issue=excluded.issue,
+                next_action=excluded.next_action,
+                extract_method=excluded.extract_method,
+                confidence=excluded.confidence,
+                status=excluded.status
+            """,
+            [asdict(entry) for entry in entries],
+        )
+        conn.commit()
+    finally:
+        conn.close()
+
+
+def save_summary_json(
+    path: Path,
     target: date,
     forum_channel_ids: list[str],
     target_user_id: str,
     scanned_threads: int,
-    target_user_messages: list[TargetUserMessage],
-) -> str:
-    by_thread: Counter[str] = Counter()
-    token_texts: list[str] = []
+    stats: dict[str, int],
+    warnings: list[str],
+    report_text: str,
+) -> None:
+    payload = {
+        "target_date": target.isoformat(),
+        "period_jst": period_label_jst(target),
+        "forum_channel_ids": forum_channel_ids,
+        "target_user_id": target_user_id,
+        "scanned_threads": scanned_threads,
+        "stats": stats,
+        "warnings": warnings,
+        "report_text": report_text,
+        "generated_at_utc": datetime.now(timezone.utc).isoformat(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    for item in target_user_messages:
-        by_thread[item.thread_name] += 1
-        if item.content:
-            token_texts.append(item.content)
 
-    forum_mentions = ", ".join(f"<#{forum_id}>" for forum_id in forum_channel_ids[:10])
-    if not forum_mentions:
-        forum_mentions = "(なし)"
-    if len(forum_channel_ids) > 10:
-        forum_mentions += f" ほか{len(forum_channel_ids) - 10}件"
-    period_start = datetime.combine(target, time.min, tzinfo=JST)
-    period_end = period_start + timedelta(days=1) - timedelta(seconds=1)
-
-    lines = [
-        f"ユーザー発言 日次レポート ({target.isoformat()} JST)",
-        f"- 対象フォーラム数: {len(forum_channel_ids)}",
-        f"- 対象フォーラム: {forum_mentions}",
-        f"- 対象ユーザー: <@{target_user_id}>",
-        f"- 集計期間: {period_start.strftime('%Y-%m-%d %H:%M:%S')} - {period_end.strftime('%Y-%m-%d %H:%M:%S')} JST",
-        f"- 対象スレッド数: {scanned_threads}",
-        f"- 総発言数: {len(target_user_messages)}",
-        "",
-        "【スレッド別件数 上位10】",
-    ]
-
-    if by_thread:
-        for idx, (thread_name, count) in enumerate(by_thread.most_common(10), start=1):
-            lines.append(f"{idx}. {thread_name}: {count}")
-    else:
-        lines.append("0件")
-
-    lines.extend(["", "【頻出語 上位10】"])
-    top_tokens = extract_top_tokens(token_texts, limit=10)
-    if top_tokens:
-        for token, count in top_tokens:
-            lines.append(f"- {token}: {count}")
-    else:
-        lines.append("- なし")
-
-    lines.extend(["", "【代表発言（最新5件）】"])
-    if target_user_messages:
-        recent = sorted(target_user_messages, key=lambda x: x.timestamp, reverse=True)[:5]
-        for item in recent:
-            excerpt = summarize_message_content(item.content, limit=80)
-            lines.append(f"- [{item.thread_name}] {excerpt}")
-    else:
-        lines.append("- なし")
-
-    return "\n".join(lines)
+def save_pipeline_outputs(
+    target: date,
+    forum_channel_ids: list[str],
+    target_user_id: str,
+    raw_messages: list[RawMessage],
+    structured_entries: list[StructuredEntry],
+    scanned_threads: int,
+    stats: dict[str, int],
+    warnings: list[str],
+    report_text: str,
+    output_dir: str,
+) -> tuple[Path, Path, Path]:
+    raw_path, sqlite_path, summary_path = build_log_file_paths(target, output_dir)
+    save_raw_messages_json(raw_path, target, forum_channel_ids, target_user_id, raw_messages)
+    save_structured_sqlite(sqlite_path, structured_entries)
+    save_summary_json(
+        summary_path,
+        target,
+        forum_channel_ids,
+        target_user_id,
+        scanned_threads,
+        stats,
+        warnings,
+        report_text,
+    )
+    return raw_path, sqlite_path, summary_path
 
 
 class DiscordClient:
@@ -253,7 +752,7 @@ class DiscordClient:
             method=method,
             headers={
                 "Authorization": f"Bot {self.bot_token}",
-                "User-Agent": "thread-owner-digest/1.0 (+https://github.com/<owner>/<repo>)",
+                "User-Agent": "thread-user-digest/2.0 (+https://github.com/<owner>/<repo>)",
             },
         )
         try:
@@ -294,6 +793,7 @@ class DiscordClient:
             archived_threads = archived.get("threads", [])
             if not archived_threads:
                 break
+
             for thread in archived_threads:
                 if int(thread.get("type", -1)) != PUBLIC_THREAD_TYPE:
                     continue
@@ -360,7 +860,7 @@ def post_to_webhook(webhook_url: str, thread_id: str, text: str) -> None:
         data=payload,
         headers={
             "Content-Type": "application/json",
-            "User-Agent": "thread-owner-digest/1.0 (+https://github.com/<owner>/<repo>)",
+            "User-Agent": "thread-user-digest/2.0 (+https://github.com/<owner>/<repo>)",
         },
         method="POST",
     )
@@ -378,43 +878,75 @@ def run() -> None:
         raise RuntimeError(
             "DISCORD_FORUM_CHANNEL_IDS または DISCORD_FORUM_CHANNEL_ID のいずれかを設定してください。"
         )
+
     target_user_id = os.environ["DISCORD_TARGET_USER_ID"]
     webhook_url = os.environ["DISCORD_WEBHOOK_URL"]
     report_thread_id = os.environ["DISCORD_REPORT_THREAD_ID"]
     target_date_raw = os.environ.get("TARGET_DATE")
     dry_run = os.environ.get("DRY_RUN", "false").strip().lower() == "true"
+    output_dir = os.environ.get("OUTPUT_DIR", OUTPUT_DIR_DEFAULT).strip() or OUTPUT_DIR_DEFAULT
+    deck_keywords_path = os.environ.get("DECK_KEYWORDS_PATH")
+    llm_api_key = os.environ.get("OPENAI_API_KEY", "").strip()
+    llm_model = os.environ.get("OPENAI_MODEL", DEFAULT_OPENAI_MODEL).strip() or DEFAULT_OPENAI_MODEL
+    llm_max = parse_positive_int(
+        os.environ.get("LLM_MAX_FALLBACK_MESSAGES"),
+        DEFAULT_LLM_MAX_FALLBACK_MESSAGES,
+    )
+    llm_timeout = parse_positive_int(
+        os.environ.get("LLM_TIMEOUT_SECONDS"),
+        DEFAULT_LLM_TIMEOUT_SECONDS,
+    )
 
     target = resolve_target_date(target_date_raw)
     start_utc, end_utc = day_bounds_utc(target)
+    warnings: list[str] = []
+
+    deck_keywords = load_deck_keywords(deck_keywords_path)
+
+    llm_extractor: LLMExtractor | None = None
+    if llm_api_key:
+        llm_extractor, llm_warning = make_openai_extractor(llm_api_key, llm_model, llm_timeout)
+        if llm_warning:
+            warnings.append(llm_warning)
+            llm_extractor = None
+    else:
+        warnings.append("OPENAI_API_KEY未設定のためrule-only modeで実行")
+
     client = DiscordClient(bot_token)
+    raw_messages, scanned_threads = collect_raw_messages(
+        client,
+        forum_channel_ids,
+        target_user_id,
+        start_utc,
+        end_utc,
+    )
 
-    target_user_messages: list[TargetUserMessage] = []
-    scanned_threads = 0
+    structured_entries, stats = build_structured_entries(
+        raw_messages,
+        target,
+        deck_keywords,
+        llm_extractor,
+        llm_max,
+    )
+    if stats["llm_failed"] > 0:
+        warnings.append(f"LLM抽出失敗: {stats['llm_failed']}件")
 
-    for forum_channel_id in forum_channel_ids:
-        threads = client.list_forum_threads(forum_channel_id, start_utc)
-        scanned_threads += len(threads)
-
-        for thread in threads:
-            thread_id = str(thread.get("id", ""))
-            thread_name = thread.get("name") or f"thread-{thread_id}"
-            if not thread_id:
-                continue
-
-            messages = client.list_thread_messages_for_window(thread_id, start_utc, end_utc)
-            target_only = filter_target_user_messages(messages, target_user_id, start_utc, end_utc)
-            for msg in target_only:
-                target_user_messages.append(
-                    TargetUserMessage(
-                        thread_id=thread_id,
-                        thread_name=thread_name,
-                        timestamp=msg["timestamp"],
-                        content=msg.get("content", ""),
-                    )
-                )
-
-    report = build_report(target, forum_channel_ids, target_user_id, scanned_threads, target_user_messages)
+    report = build_review_report(target, structured_entries, warnings)
     print(report)
+
+    raw_path, sqlite_path, summary_path = save_pipeline_outputs(
+        target=target,
+        forum_channel_ids=forum_channel_ids,
+        target_user_id=target_user_id,
+        raw_messages=raw_messages,
+        structured_entries=structured_entries,
+        scanned_threads=scanned_threads,
+        stats=stats,
+        warnings=warnings,
+        report_text=report,
+        output_dir=output_dir,
+    )
+    print(f"ログ保存: {raw_path} / {sqlite_path} / {summary_path}")
 
     if dry_run:
         print("DRY_RUN=true のため投稿をスキップしました。")
