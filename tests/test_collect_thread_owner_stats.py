@@ -10,6 +10,7 @@ from scripts.collect_thread_owner_stats import (
     build_log_file_paths,
     build_review_report,
     build_structured_entries,
+    categorize_llm_error,
     day_bounds_utc,
     extract_issue_text,
     extract_matchup,
@@ -181,6 +182,12 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
 
         invalid = validate_llm_payload({"matchup": ["AF"]})
         self.assertIsNone(invalid)
+
+    def test_categorize_llm_error_401(self) -> None:
+        self.assertEqual(
+            categorize_llm_error("Error code: 401 - {'error': {'message': 'Incorrect API key provided'}}"),
+            "認証エラー (APIキー/401)",
+        )
 
     def test_save_structured_sqlite_upsert(self) -> None:
         with tempfile.TemporaryDirectory() as tmpdir:
