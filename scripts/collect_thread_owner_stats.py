@@ -220,6 +220,34 @@ def split_for_discord(text: str, max_len: int = MAX_DISCORD_CHARS) -> list[str]:
     return [chunk for chunk in chunks if chunk]
 
 
+def make_excerpt(text: str, limit: int = 80) -> str:
+    compact = compact_text(text)
+    if not compact:
+        return "(本文なし)"
+    return compact if len(compact) <= limit else compact[: limit - 1] + "…"
+
+
+def categorize_llm_error(error: str | None) -> str:
+    if not error:
+        return "unknown error"
+    lowered = error.lower()
+    if "401" in lowered or "invalid_api_key" in lowered or "incorrect api key" in lowered:
+        return "認証エラー (APIキー/401)"
+    if "403" in lowered or "permission" in lowered or "forbidden" in lowered:
+        return "権限エラー (403)"
+    if "404" in lowered or ("model" in lowered and "not found" in lowered):
+        return "モデル未検出/不正指定 (404)"
+    if "429" in lowered or "rate limit" in lowered:
+        return "レート制限 (429)"
+    if "timeout" in lowered or "timed out" in lowered:
+        return "タイムアウト"
+    if "json" in lowered:
+        return "JSON解析エラー"
+    if "connection" in lowered or "network" in lowered:
+        return "接続エラー"
+    return error.splitlines()[0][:120]
+
+
 def load_deck_keywords(path: str | None) -> list[str]:
     if not path:
         return DEFAULT_DECK_KEYWORDS[:]
@@ -435,7 +463,7 @@ def build_structured_entries(
     deck_keywords: list[str],
     llm_extractor: LLMExtractor | None,
     llm_max_fallback_messages: int,
-) -> tuple[list[StructuredEntry], dict[str, int]]:
+) -> tuple[list[StructuredEntry], dict[str, int], dict[str, Any]]:
     entries: list[StructuredEntry] = []
     unresolved_indexes: list[int] = []
 
@@ -464,8 +492,13 @@ def build_structured_entries(
     llm_attempted = 0
     llm_succeeded = 0
     llm_failed = 0
+    llm_failure_reasons: Counter[str] = Counter()
+    llm_failure_samples: list[dict[str, str]] = []
+    llm_unattempted_due_limit = 0
 
     if llm_extractor:
+        if len(unresolved_indexes) > llm_max_fallback_messages:
+            llm_unattempted_due_limit = len(unresolved_indexes) - llm_max_fallback_messages
         for idx in unresolved_indexes[:llm_max_fallback_messages]:
             llm_attempted += 1
             payload, error = llm_extractor(entries[idx].raw_text)
@@ -474,6 +507,17 @@ def build_structured_entries(
                 entries[idx].status = "unclassified"
                 entries[idx].confidence = 0.0
                 llm_failed += 1
+                reason = categorize_llm_error(error)
+                llm_failure_reasons[reason] += 1
+                if len(llm_failure_samples) < 5:
+                    llm_failure_samples.append(
+                        {
+                            "message_id": entries[idx].message_id,
+                            "thread_id": entries[idx].thread_id,
+                            "reason": reason,
+                            "raw_excerpt": make_excerpt(entries[idx].raw_text, 80),
+                        }
+                    )
                 continue
 
             llm_fields = {
@@ -496,6 +540,17 @@ def build_structured_entries(
                 entries[idx].status = "unclassified"
                 entries[idx].confidence = 0.0
                 llm_failed += 1
+                reason = "LLM応答はあったが抽出項目なし"
+                llm_failure_reasons[reason] += 1
+                if len(llm_failure_samples) < 5:
+                    llm_failure_samples.append(
+                        {
+                            "message_id": entries[idx].message_id,
+                            "thread_id": entries[idx].thread_id,
+                            "reason": reason,
+                            "raw_excerpt": make_excerpt(entries[idx].raw_text, 80),
+                        }
+                    )
 
     stats = {
         "raw_count": len(raw_messages),
@@ -505,7 +560,15 @@ def build_structured_entries(
         "llm_succeeded": llm_succeeded,
         "llm_failed": llm_failed,
     }
-    return entries, stats
+    diagnostics: dict[str, Any] = {
+        "llm_failure_reasons_top": [
+            {"reason": reason, "count": count}
+            for reason, count in llm_failure_reasons.most_common(5)
+        ],
+        "llm_failure_samples": llm_failure_samples,
+        "llm_unattempted_due_limit": llm_unattempted_due_limit,
+    }
+    return entries, stats, diagnostics
 
 
 def parse_result_to_counts(result: str | None) -> tuple[int, int]:
@@ -542,7 +605,12 @@ def collect_issue_entries(entries: list[StructuredEntry]) -> list[dict[str, str]
     return issues
 
 
-def build_review_report(target: date, entries: list[StructuredEntry], warnings: list[str]) -> str:
+def build_review_report(
+    target: date,
+    entries: list[StructuredEntry],
+    warnings: list[str],
+    diagnostics: dict[str, Any] | None = None,
+) -> str:
     period = period_label_jst(target)
     wins = 0
     losses = 0
@@ -594,6 +662,16 @@ def build_review_report(target: date, entries: list[StructuredEntry], warnings: 
             lines.append(f"- ほか{len(issue_entries) - 20}件")
     else:
         lines.append("- なし")
+
+    llm_failure_reasons = []
+    if diagnostics:
+        llm_failure_reasons = diagnostics.get("llm_failure_reasons_top") or []
+    if llm_failure_reasons:
+        lines.extend(["", "【LLM抽出失敗内訳 上位5】"])
+        for item in llm_failure_reasons:
+            reason = str(item.get("reason", "unknown"))
+            count = int(item.get("count", 0))
+            lines.append(f"- {reason}: {count}件")
 
     if warnings:
         lines.extend(["", "【処理メモ】"])
@@ -693,6 +771,7 @@ def save_summary_json(
     scanned_threads: int,
     stats: dict[str, int],
     warnings: list[str],
+    diagnostics: dict[str, Any],
     report_text: str,
 ) -> None:
     payload = {
@@ -703,6 +782,7 @@ def save_summary_json(
         "scanned_threads": scanned_threads,
         "stats": stats,
         "warnings": warnings,
+        "diagnostics": diagnostics,
         "report_text": report_text,
         "generated_at_utc": datetime.now(timezone.utc).isoformat(),
     }
@@ -719,6 +799,7 @@ def save_pipeline_outputs(
     scanned_threads: int,
     stats: dict[str, int],
     warnings: list[str],
+    diagnostics: dict[str, Any],
     report_text: str,
     output_dir: str,
 ) -> tuple[Path, Path, Path]:
@@ -733,6 +814,7 @@ def save_pipeline_outputs(
         scanned_threads,
         stats,
         warnings,
+        diagnostics,
         report_text,
     )
     return raw_path, sqlite_path, summary_path
@@ -921,7 +1003,7 @@ def run() -> None:
         end_utc,
     )
 
-    structured_entries, stats = build_structured_entries(
+    structured_entries, stats, diagnostics = build_structured_entries(
         raw_messages,
         target,
         deck_keywords,
@@ -930,8 +1012,12 @@ def run() -> None:
     )
     if stats["llm_failed"] > 0:
         warnings.append(f"LLM抽出失敗: {stats['llm_failed']}件")
+        for item in diagnostics.get("llm_failure_reasons_top", [])[:3]:
+            warnings.append(f"LLM失敗内訳: {item['reason']} ({item['count']}件)")
+    if diagnostics.get("llm_unattempted_due_limit", 0) > 0:
+        warnings.append(f"LLM未実行（上限超過）: {diagnostics['llm_unattempted_due_limit']}件")
 
-    report = build_review_report(target, structured_entries, warnings)
+    report = build_review_report(target, structured_entries, warnings, diagnostics)
     print(report)
 
     raw_path, sqlite_path, summary_path = save_pipeline_outputs(
@@ -943,6 +1029,7 @@ def run() -> None:
         scanned_threads=scanned_threads,
         stats=stats,
         warnings=warnings,
+        diagnostics=diagnostics,
         report_text=report,
         output_dir=output_dir,
     )

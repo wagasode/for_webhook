@@ -111,7 +111,7 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
                 None,
             )
 
-        entries, stats = build_structured_entries(
+        entries, stats, diagnostics = build_structured_entries(
             raw_messages=raw_messages,
             target=target,
             deck_keywords=["AF"],
@@ -129,6 +129,7 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
         self.assertEqual(entries[1].extract_method, "llm")
         self.assertEqual(entries[1].status, "classified")
         self.assertEqual(entries[1].next_action, "7ターン目分岐を先後で整理")
+        self.assertEqual(diagnostics["llm_failure_reasons_top"], [])
 
     def test_build_structured_entries_llm_failure_keeps_unclassified(self) -> None:
         target = date(2026, 3, 15)
@@ -145,7 +146,7 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
         def fake_llm(_: str) -> tuple[dict[str, object] | None, str | None]:
             return None, "invalid-json"
 
-        entries, stats = build_structured_entries(
+        entries, stats, diagnostics = build_structured_entries(
             raw_messages=raw_messages,
             target=target,
             deck_keywords=["AF"],
@@ -157,6 +158,10 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
         self.assertEqual(entries[0].extract_method, "llm_failed")
         self.assertEqual(stats["llm_failed"], 1)
         self.assertEqual(stats["unclassified_count"], 1)
+        self.assertEqual(diagnostics["llm_failure_reasons_top"][0]["reason"], "JSON解析エラー")
+        self.assertEqual(diagnostics["llm_failure_reasons_top"][0]["count"], 1)
+        self.assertEqual(diagnostics["llm_failure_samples"][0]["message_id"], "1")
+        self.assertEqual(diagnostics["llm_unattempted_due_limit"], 0)
 
     def test_validate_llm_payload(self) -> None:
         valid = validate_llm_payload(
@@ -266,6 +271,11 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
             target=date(2026, 3, 15),
             entries=entries,
             warnings=["OPENAI_API_KEY未設定のためrule-only modeで実行"],
+            diagnostics={
+                "llm_failure_reasons_top": [
+                    {"reason": "レート制限 (429)", "count": 2},
+                ]
+            },
         )
 
         self.assertIn("- 対象期間: 2026-03-15 00:00:00 - 2026-03-15 23:59:59 JST", report)
@@ -279,6 +289,8 @@ class CollectThreadOwnerStatsTest(unittest.TestCase):
         self.assertIn("- 1件", report)
         self.assertIn("【昨日見つけた課題一覧 (1件)】", report)
         self.assertIn("<#thread-1>", report)
+        self.assertIn("【LLM抽出失敗内訳 上位5】", report)
+        self.assertIn("- レート制限 (429): 2件", report)
 
     def test_build_log_file_paths(self) -> None:
         raw_path, sqlite_path, summary_path = build_log_file_paths(date(2026, 3, 15), "artifacts")
