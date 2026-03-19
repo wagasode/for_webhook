@@ -29,6 +29,42 @@ jobs:
       - name: Install dependencies
         run: pip install openai
 
+      - name: Check OpenAI secret presence
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          key = os.getenv("OPENAI_API_KEY", "")
+          print(f"OPENAI_API_KEY is set: {bool(key)}")
+          print(f"OPENAI_API_KEY length: {len(key)}")
+          if not key:
+              print("OPENAI_API_KEY is missing. The digest will run in rule-only mode.")
+          PY
+
+      - name: Check OpenAI auth
+        env:
+          OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
+        run: |
+          python3 - <<'PY'
+          import os
+          import sys
+
+          key = os.getenv("OPENAI_API_KEY", "").strip()
+          if not key:
+              print("OpenAI auth check skipped (OPENAI_API_KEY is not set).")
+              sys.exit(0)
+
+          from openai import OpenAI
+          try:
+              client = OpenAI(api_key=key, timeout=20)
+              client.models.list()
+              print("OpenAI auth check: OK")
+          except Exception as exc:
+              print(f"OpenAI auth check: NG ({exc})")
+              sys.exit(1)
+          PY
+
       - name: Run digest (schedule)
         if: github.event_name == 'schedule'
         env:
